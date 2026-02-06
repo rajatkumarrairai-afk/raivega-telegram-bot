@@ -9,36 +9,53 @@ app.use(cors());
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 
-let messages = [];
+let sessions = {};
+let sessionMap = {};
+let clientCounter = 1;
 let lastUpdateId = 0;
 
-// Send message from website to Telegram
-app.post("/send", async (req, res) => {
-  const { message } = req.body;
+// Assign Client_X automatically
+function getClientName(sessionId) {
+  if (!sessionMap[sessionId]) {
+    sessionMap[sessionId] = "Client_" + clientCounter++;
+  }
+  return sessionMap[sessionId];
+}
 
-  messages.push({ from: "user", text: message });
+// Send message from website
+app.post("/send", async (req, res) => {
+  const { message, sessionId } = req.body;
+
+  const clientName = getClientName(sessionId);
+
+  if (!sessions[sessionId]) {
+    sessions[sessionId] = [];
+  }
+
+  sessions[sessionId].push({ from: "client", text: message });
 
   try {
     await axios.post(
       `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
       {
         chat_id: CHAT_ID,
-        text: message
+        text: `${clientName}: ${message}`
       }
     );
-  } catch (error) {
-    console.log("Send error:", error.message);
+  } catch (err) {
+    console.log("Send error:", err.message);
   }
 
   res.json({ status: "sent" });
 });
 
-// Return all messages
-app.get("/messages", (req, res) => {
-  res.json(messages);
+// Return session messages
+app.get("/messages/:sessionId", (req, res) => {
+  const sessionId = req.params.sessionId;
+  res.json(sessions[sessionId] || []);
 });
 
-// Poll Telegram for replies
+// Poll Telegram replies
 setInterval(async () => {
   try {
     const response = await axios.get(
@@ -55,10 +72,25 @@ setInterval(async () => {
         update.message.text &&
         update.message.chat.id.toString() === CHAT_ID
       ) {
-        messages.push({
-          from: "bot",
-          text: update.message.text
-        });
+        const text = update.message.text;
+
+        // Detect reply starting with Client_X:
+        const match = text.match(/^(Client_\d+):\s(.+)/);
+
+        if (match) {
+          const clientName = match[1];
+          const reply = match[2];
+
+          const sessionId = Object.keys(sessionMap)
+            .find(key => sessionMap[key] === clientName);
+
+          if (sessionId) {
+            sessions[sessionId].push({
+              from: "agent",
+              text: reply
+            });
+          }
+        }
       }
     });
 
@@ -68,9 +100,9 @@ setInterval(async () => {
 }, 3000);
 
 app.get("/", (req, res) => {
-  res.send("Telegram Bot Running");
+  res.send("Telegram Bot Running (Client Mode)");
 });
 
 app.listen(3000, () => {
-  console.log("Server running on port 3000");
+  console.log("Server running");
 });
