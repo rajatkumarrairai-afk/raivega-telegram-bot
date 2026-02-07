@@ -11,6 +11,7 @@ const CHAT_ID = process.env.CHAT_ID;
 
 let sessions = {};
 let sessionMap = {};
+let telegramMessageMap = {};
 let clientCounter = 1;
 let lastUpdateId = 0;
 
@@ -35,13 +36,19 @@ app.post("/send", async (req, res) => {
   sessions[sessionId].push({ from: "client", text: message });
 
   try {
-    await axios.post(
+    const telegramResponse = await axios.post(
       `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
       {
         chat_id: CHAT_ID,
-        text: `${clientName}: ${message}`
+        text: `${clientName}:\n${message}`
       }
     );
+
+    const telegramMessageId = telegramResponse.data.result.message_id;
+
+    // Store mapping between Telegram message and session
+    telegramMessageMap[telegramMessageId] = sessionId;
+
   } catch (err) {
     console.log("Send error:", err.message);
   }
@@ -49,13 +56,13 @@ app.post("/send", async (req, res) => {
   res.json({ status: "sent" });
 });
 
-// Return session messages
+// Return messages per session
 app.get("/messages/:sessionId", (req, res) => {
   const sessionId = req.params.sessionId;
   res.json(sessions[sessionId] || []);
 });
 
-// Poll Telegram replies
+// Poll Telegram for replies
 setInterval(async () => {
   try {
     const response = await axios.get(
@@ -69,25 +76,23 @@ setInterval(async () => {
 
       if (
         update.message &&
-        update.message.text &&
         update.message.chat.id.toString() === CHAT_ID
       ) {
-        const text = update.message.text;
+        const msg = update.message;
 
-        // Detect reply starting with Client_X:
-        const match = text.match(/^(Client_\d+):\s(.+)/);
-
-        if (match) {
-          const clientName = match[1];
-          const reply = match[2];
-
-          const sessionId = Object.keys(sessionMap)
-            .find(key => sessionMap[key] === clientName);
+        // Only process replies
+        if (msg.reply_to_message) {
+          const repliedMessageId = msg.reply_to_message.message_id;
+          const sessionId = telegramMessageMap[repliedMessageId];
 
           if (sessionId) {
+            if (!sessions[sessionId]) {
+              sessions[sessionId] = [];
+            }
+
             sessions[sessionId].push({
               from: "agent",
-              text: reply
+              text: msg.text
             });
           }
         }
@@ -100,7 +105,7 @@ setInterval(async () => {
 }, 3000);
 
 app.get("/", (req, res) => {
-  res.send("Telegram Bot Running (Client Mode)");
+  res.send("Telegram Bot Running (Reply Mode Enabled)");
 });
 
 app.listen(3000, () => {
