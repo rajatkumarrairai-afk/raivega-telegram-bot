@@ -1,136 +1,80 @@
 const express = require("express");
-const axios = require("axios");
 const cors = require("cors");
+const fetch = require("node-fetch");
 
 const app = express();
-app.use(express.json());
 app.use(cors());
+app.use(express.json());
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
+const TELEGRAM_CHAT_ID = process.env.CHAT_ID;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
 let sessions = {};
-let sessionMap = {};
-let telegramMessageMap = {};
-let clientCounter = 1;
-let lastUpdateId = 0;
+let messageIdToSession = {};
 
-/* =============================
-   CLIENT NAME ASSIGNMENT
-============================= */
-
-function getClientName(sessionId) {
-  if (!sessionMap[sessionId]) {
-    sessionMap[sessionId] = "Client_" + clientCounter++;
+/*
+sessions structure:
+{
+  sessionId: {
+    name,
+    company,
+    country,
+    messages: [],
+    telegramMessageIds: []
   }
-  return sessionMap[sessionId];
 }
+*/
 
-/* =============================
-   SMART FREIGHT QUICK ENGINE
-============================= */
-
-function smartReply(session, message) {
-  const msg = message.toLowerCase();
-
-  if (!session.state) session.state = "normal";
-
-  // Greeting
-  if (msg === "hi" || msg.includes("hello")) {
-    return "Welcome to RAIVEGA. Please share your shipment requirement.";
-  }
-
-  // ================= RATE FLOW =================
-  if (msg.includes("rate") || msg.includes("quote")) {
-
-    if (session.state === "awaiting_rate_details") {
-      return "Kindly share POL, POD, container type and cargo details so we can proceed.";
-    }
-
-    session.state = "awaiting_rate_details";
-    return "To provide accurate rates, please share POL, POD, container type (20DV/40HC), commodity and cargo readiness date.";
-  }
-
-  // Detect shipment details provided
-  const hasContainer = msg.includes("20") || msg.includes("40");
-  const hasDirection = msg.includes(" to ") || msg.includes(" from ");
-
-  if (session.state === "awaiting_rate_details" && (hasContainer || hasDirection)) {
-    session.state = "normal";
-    return "Thank you. Our pricing team is reviewing your shipment details and will revert shortly.";
-  }
-
-  // ================= OTHER FLOWS =================
-
-  if (msg.includes("booking")) {
-    return "Kindly provide booking number or shipment reference for status verification.";
-  }
-
-  if (msg.includes("air")) {
-    return "For air freight, please share origin airport, destination airport and chargeable weight.";
-  }
-
-  if (msg.includes("bl") || msg.includes("bill of lading")) {
-    return "Please confirm BL number and whether it is Original or Telex Release.";
-  }
-
-  if (msg.includes("invoice") || msg.includes("charges")) {
-    return "Please provide invoice number for verification.";
-  }
-
-  if (msg.includes("documentation")) {
-    return "Kindly specify required document type (Invoice, Packing List, COO, BL Draft).";
-  }
-
-  return null;
-}
-
-/* =============================
-   SEND FROM WEBSITE
-============================= */
+/* ================= SEND MESSAGE FROM WEBSITE ================= */
 
 app.post("/send", async (req, res) => {
-  const { message, sessionId } = req.body;
+
+  const { message, sessionId, name, company, country } = req.body;
 
   if (!sessions[sessionId]) {
-    sessions[sessionId] = { messages: [], state: "normal" };
+    sessions[sessionId] = {
+      name,
+      company,
+      country,
+      messages: [],
+      telegramMessageIds: []
+    };
   }
 
   const session = sessions[sessionId];
-  const clientName = getClientName(sessionId);
 
-  session.messages.push({ from: "client", text: message });
+  session.messages.push({
+    from: "client",
+    text: message
+  });
 
-  // Smart Auto Reply
-  const auto = smartReply(session, message);
-  if (auto) {
-    session.messages.push({ from: "agent", text: auto });
+  const label = `${session.name} | ${session.company} | ${session.country}`;
+
+  const telegramResponse = await fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: TELEGRAM_CHAT_ID,
+      text: `${label}\n\n${message}`
+    })
+  });
+
+  const telegramData = await telegramResponse.json();
+
+  if (telegramData.result) {
+    const telegramMessageId = telegramData.result.message_id;
+    session.telegramMessageIds.push(telegramMessageId);
+    messageIdToSession[telegramMessageId] = sessionId;
   }
 
-  try {
-    const tgResponse = await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-      {
-        chat_id: CHAT_ID,
-        text: `${clientName}:\n${message}`
-      }
-    );
-
-    const telegramMsgId = tgResponse.data.result.message_id;
-    telegramMessageMap[telegramMsgId] = sessionId;
-
-  } catch (err) {
-    console.log("Telegram send error:", err.message);
-  }
-
-  res.json({ status: "ok" });
+  res.json({ status: "sent" });
 });
 
-/* =============================
-   FETCH SESSION MESSAGES
-============================= */
+/* ================= FETCH MESSAGES FOR WEBSITE ================= */
 
 app.get("/messages/:sessionId", (req, res) => {
+
   const sessionId = req.params.sessionId;
 
   if (!sessions[sessionId]) {
@@ -140,57 +84,72 @@ app.get("/messages/:sessionId", (req, res) => {
   res.json(sessions[sessionId].messages);
 });
 
-/* =============================
-   TELEGRAM POLLING (NO DUPLICATES)
-============================= */
+/* ================= TELEGRAM POLLING ================= */
 
-setInterval(async () => {
+let offset = 0;
+
+async function pollTelegram() {
+
   try {
-    const response = await axios.get(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${lastUpdateId + 1}`
+
+    const response = await fetch(
+      `${TELEGRAM_API}/getUpdates?offset=${offset}`
     );
 
-    const updates = response.data.result;
+    const data = await response.json();
 
-    if (!updates.length) return;
+    if (data.result.length > 0) {
 
-    updates.forEach(update => {
-      lastUpdateId = update.update_id;
+      data.result.forEach(update => {
 
-      if (
-        update.message &&
-        update.message.chat.id.toString() === CHAT_ID
-      ) {
-        const msg = update.message;
+        offset = update.update_id + 1;
 
-        // Only process replies
-        if (msg.reply_to_message) {
-          const repliedMessageId = msg.reply_to_message.message_id;
-          const sessionId = telegramMessageMap[repliedMessageId];
+        if (
+          update.message &&
+          update.message.text &&
+          update.message.reply_to_message
+        ) {
+
+          const replyToId = update.message.reply_to_message.message_id;
+          const sessionId = messageIdToSession[replyToId];
 
           if (sessionId && sessions[sessionId]) {
+
+            const agentFirstName =
+              update.message.from.first_name || "RAIVEGA";
+
+            const agentLabel = `Mr ${agentFirstName} - RAIVEGA`;
+
             sessions[sessionId].messages.push({
               from: "agent",
-              text: msg.text
+              text: update.message.text,
+              agentName: agentLabel
             });
+
           }
+
         }
-      }
-    });
+
+      });
+
+    }
 
   } catch (err) {
     console.log("Polling error:", err.message);
   }
-}, 3000);
 
-/* =============================
-   ROOT CHECK
-============================= */
+  setTimeout(pollTelegram, 3000);
+}
+
+pollTelegram();
+
+/* ================= ROOT ================= */
 
 app.get("/", (req, res) => {
-  res.send("RAIVEGA Telegram AI Support Running - Stable Mode");
+  res.send("Professional Telegram Support Bot Running");
 });
 
-app.listen(3000, () => {
-  console.log("Server running on port 3000");
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () =>
+  console.log("Server running on port", PORT)
+);
